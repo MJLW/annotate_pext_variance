@@ -10,6 +10,7 @@ use std::{
     fs::File,
     io::BufReader,
     path::{Path, PathBuf},
+    str::from_utf8,
 };
 
 #[derive(Parser, Debug)]
@@ -49,7 +50,7 @@ struct RawVariant {
     #[serde(rename = "vepFeature")]
     transcript: String,
 
-    #[serde(rename = "vepSYMBOL")]
+    #[serde(rename = "vepGene")]
     gene: String,
 
     #[serde(rename = "vepConsequence")]
@@ -59,7 +60,7 @@ struct RawVariant {
     loftee: String,
 }
 
-struct Transcript {
+struct TranscriptAnnotation {
     id: String,
     gene: String,
     consequence: String,
@@ -71,16 +72,7 @@ struct Variant {
     pos: usize,
     reference: String,
     alternative: String,
-    transcripts: Vec<Transcript>,
-}
-
-struct AnnotatedVariant {
-    chr: String,
-    pos: usize,
-    reference: String,
-    alternative: String,
-    transcripts: Vec<Transcript>,
-    pext: Vec<f16>,
+    transcripts: Vec<TranscriptAnnotation>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -92,12 +84,17 @@ struct SampleTissue {
     tissue: String,
 }
 
-pub struct Tissue {
-    pub tissue: String,
-    pub samples: Vec<f16>,
+struct Tissue {
+    tissue: String,
+    samples: Vec<f16>,
 }
 
-pub type TsvMap = HashMap<String, Vec<Tissue>>;
+struct Transcript {
+    transcript_id: String,
+    tissues: Vec<Tissue>,
+}
+
+type TsvMap = HashMap<String, Vec<Transcript>>;
 
 type VariantKey = (String, usize, String, String);
 
@@ -113,7 +110,8 @@ struct PextVariance {
     gene: String,
     consequence: String,
     loftee: String,
-    variance: f32,
+    tissue: String,
+    variance: f16,
 }
 
 fn variant_key(row: &RawVariant) -> VariantKey {
@@ -138,7 +136,7 @@ fn read_variants(path: PathBuf) -> Result<Vec<Variant>, Box<dyn Error>> {
         let row = result?;
         let key = variant_key(&row);
 
-        let transcript = Transcript {
+        let transcript = TranscriptAnnotation {
             id: row.transcript.clone(),
             gene: row.gene.clone(),
             consequence: row.consequence.clone(),
@@ -206,7 +204,17 @@ fn read_tsv(
     let mut record = csv::ByteRecord::new();
 
     while rdr.read_byte_record(&mut record)? {
-        let key = std::str::from_utf8(&record[0])?.to_owned();
+        let gid = std::str::from_utf8(&record[1])?
+            .split(".")
+            .next()
+            .ok_or("Could not split gene id")?
+            .to_owned();
+
+        let tid = std::str::from_utf8(&record[0])?
+            .split(".")
+            .next()
+            .ok_or("Could not split transcript id")?
+            .to_owned();
 
         // Build a fresh Vec<Tissue> skeleton for this row
         let mut tissues: Vec<Tissue> = unique_tissues
@@ -219,17 +227,30 @@ fn read_tsv(
 
         // Distribute each float into the correct Tissue bucket
         for (col_idx, st) in sample_tissues.iter().enumerate() {
-            let raw = &record[col_idx + 1];
+            let raw = &record[col_idx + 2];
+
             let val = std::str::from_utf8(raw)?
                 .parse::<f32>()
-                .map(f16::from_f32)
-                .unwrap_or(f16::NAN);
+                .map(f16::from_f32)?;
 
             let idx = tissue_idx[st.tissue.as_str()];
             tissues[idx].samples.push(val);
         }
 
-        map.insert(key, tissues);
+        let t = Transcript {
+            transcript_id: tid,
+            tissues: tissues,
+        };
+
+        if let Some(transcripts) = map.get_mut(&gid) {
+            transcripts.push(t);
+            continue;
+        }
+
+        let mut transcripts: Vec<Transcript> = Vec::new();
+        transcripts.push(t);
+
+        map.insert(gid, transcripts);
     }
 
     Ok(map)
@@ -252,18 +273,32 @@ fn calculate_pext(variant: &Variant, matrix: &TsvMap) -> Result<Vec<PextVariance
 
     let mut tpms: Vec<SampleTPM> = Vec::new();
     for gene in &unique_genes {
-        for transcript in &variant.transcripts {
-            if &transcript.gene != gene {
-                continue;
-            }
+        if let Some(transcripts) = matrix.get(gene) {
+            for transcript in transcripts {
+                if let Some(variant_transcript) = variant
+                    .transcripts
+                    .iter()
+                    .find(|t| transcript.transcript_id == t.id)
+                {
+                    for tissue in &transcript.tissues {
+                        tpms.push(SampleTPM {
+                            gene: gene.clone(),
+                            consequence: variant_transcript.consequence.clone(),
+                            tissue: tissue.tissue.clone(),
+                            loftee: variant_transcript.loftee.clone(),
+                            tpm: tissue.samples.iter().map(|x| x.to_f32()).collect(),
+                        });
+                    }
 
-            if let Some(tissues) = matrix.get(&transcript.id) {
-                for tissue in tissues {
+                    continue;
+                }
+
+                for tissue in &transcript.tissues {
                     tpms.push(SampleTPM {
                         gene: gene.clone(),
-                        consequence: transcript.consequence.clone(),
+                        consequence: "".to_string(),
                         tissue: tissue.tissue.clone(),
-                        loftee: transcript.loftee.clone(),
+                        loftee: "".to_string(),
                         tpm: tissue.samples.iter().map(|x| x.to_f32()).collect(),
                     });
                 }
@@ -274,6 +309,7 @@ fn calculate_pext(variant: &Variant, matrix: &TsvMap) -> Result<Vec<PextVariance
     let unique_consequences: Vec<String> = tpms
         .iter()
         .map(|tpm| tpm.consequence.to_string())
+        .filter(|csq| csq != "")
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -281,6 +317,7 @@ fn calculate_pext(variant: &Variant, matrix: &TsvMap) -> Result<Vec<PextVariance
     let unique_loftee: Vec<String> = tpms
         .iter()
         .map(|tpm| tpm.loftee.to_string())
+        .filter(|loftee| loftee != "")
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -301,7 +338,7 @@ fn calculate_pext(variant: &Variant, matrix: &TsvMap) -> Result<Vec<PextVariance
                 .map(|tpm| &tpm.tpm)
                 .collect();
 
-            let n_samples = tissue_tpms.get(0).ok_or("Found no TPMs.").iter().len();
+            let n_samples = tissue_tpms.get(0).ok_or("Found no TPMs.")?.len();
 
             let total_tissue_tpms: Vec<f32> =
                 tissue_tpms
@@ -326,7 +363,10 @@ fn calculate_pext(variant: &Variant, matrix: &TsvMap) -> Result<Vec<PextVariance
                         .map(|tpm| &tpm.tpm)
                         .collect();
 
-                    let n_samples = annotation_tpms.get(0).ok_or("Found no TPMs.").iter().len();
+                    // If this combination of annotations doesn't exist
+                    if annotation_tpms.len() == 0 {
+                        continue;
+                    }
 
                     let total_annotation_tpms: Vec<f32> =
                         annotation_tpms
@@ -344,27 +384,30 @@ fn calculate_pext(variant: &Variant, matrix: &TsvMap) -> Result<Vec<PextVariance
                         .map(|(x, d)| x / d)
                         .collect();
 
-                    let variance = calculate_variance(pext_scores);
+                    let variance = f16::from_f32(calculate_variance(pext_scores));
+
+                    if variance.is_nan() {
+                        variances.push(PextVariance {
+                            gene: gene.clone(),
+                            consequence: consequence.clone(),
+                            loftee: loftee.clone(),
+                            tissue: tissue.clone(),
+                            variance: f16::from_f32(0.0),
+                        });
+                        continue;
+                    }
+
                     variances.push(PextVariance {
                         gene: gene.clone(),
                         consequence: consequence.clone(),
                         loftee: loftee.clone(),
+                        tissue: tissue.clone(),
                         variance: variance,
                     });
                 }
             }
         }
     }
-
-    // let prop_tissue_tpms: Vec<Vec<f32>> = tissue_tpms
-    // .iter()
-    // .map(|row| {
-    //     row.iter()
-    //         .zip(total_tissue_tpms.iter())
-    //         .map(|(&x, &d)| x / d)
-    //         .collect()
-    // })
-    // .collect();
 
     Ok(variances)
 }
@@ -383,28 +426,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for variant in variants {
         let variances = calculate_pext(&variant, &matrix)?;
 
-        for transcript in &variant.transcripts {
-            let tissue_variances: Vec<_> = variances
-                .iter()
-                .filter(|v| {
-                    v.gene == transcript.gene
-                        && v.consequence == transcript.consequence
-                        && v.loftee == transcript.loftee
-                })
-                .map(|v| v.variance.to_string())
-                .collect();
-
-            let joined_tissue_variances: String = tissue_variances.join("\t");
-
+        for variance in variances {
             writer.write_record(&[
                 &variant.chr,
                 &variant.pos.to_string(),
                 &variant.reference,
                 &variant.alternative,
-                &transcript.gene,
-                &transcript.loftee,
-                &transcript.consequence,
-                &joined_tissue_variances,
+                &variance.gene,
+                &variance.loftee,
+                &variance.consequence,
+                &variance.tissue,
+                &variance.variance.to_string(),
             ])?;
         }
     }
