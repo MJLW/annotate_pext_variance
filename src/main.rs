@@ -518,7 +518,7 @@ fn calculate_pext(
                 .map(|tpm| &tpm.tpm)
                 .collect();
 
-            let n_samples = total_transcripts.get(0).ok_or("Found no TPMs.")?.len();
+            let n_samples: usize = total_transcripts.get(0).ok_or("Found no TPMs.")?.len();
             let total_tissue_tpms: Vec<f32> = matrix_vertical_sum(&total_transcripts, n_samples);
 
             let present_transcripts: Vec<&Vec<f32>> = tpms
@@ -537,7 +537,11 @@ fn calculate_pext(
                 .map(|(x, d)| x / d)
                 .collect();
 
-            let pext: f16 = f16::from_f32(pext_scores.iter().sum());
+            println!("PRESENT: {:?}", present_tissue_tpms);
+            println!("TOTAL: {:?}", total_tissue_tpms);
+            println!("PEXT: {:?}", pext_scores);
+
+            let pext: f32 = pext_scores.iter().sum();
 
             if pext.is_nan() {
                 variances.push(SimplePextScore {
@@ -551,7 +555,7 @@ fn calculate_pext(
             variances.push(SimplePextScore {
                 gene: gene.clone(),
                 tissue: tissue.clone(),
-                score: pext,
+                score: f16::from_f32(pext / (n_samples as f32)),
             });
         }
     }
@@ -610,7 +614,7 @@ fn calculate_annotated_pext(
                         .map(|(x, d)| x / d)
                         .collect();
 
-                    let pext: f16 = f16::from_f32(pext_scores.iter().sum());
+                    let pext: f32 = pext_scores.iter().sum();
 
                     if pext.is_nan() {
                         variances.push(AnnotatedPextScore {
@@ -628,7 +632,7 @@ fn calculate_annotated_pext(
                         consequence: consequence.clone(),
                         loftee: loftee.clone(),
                         tissue: tissue.clone(),
-                        score: pext,
+                        score: f16::from_f32(pext / (n_samples as f32)),
                     });
                 }
             }
